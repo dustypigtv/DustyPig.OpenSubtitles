@@ -10,7 +10,7 @@ public class DownloadRequest
     public long FileId { get; set; }
 
     /// <summary>
-    /// From <see cref="Endpoints.Infos.GetSubtitleFormatsAsync(System.Threading.CancellationToken)"/>
+    /// From <see cref="Client.GetSubtitleFormatsAsync"/>
     /// </summary>
     [JsonPropertyName("sub_format")]
     public string SubFormat { get; set; }
