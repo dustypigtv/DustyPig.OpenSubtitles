@@ -1,6 +1,7 @@
 ﻿using DustyPig.OpenSubtitles.Models;
 using DustyPig.OpenSubtitles.Utils;
 using DustyPig.REST;
+using Microsoft.Extensions.Logging;
 using System;
 using System.Collections.Generic;
 using System.Net;
@@ -11,7 +12,7 @@ using System.Threading.Tasks;
 
 namespace DustyPig.OpenSubtitles;
 
-public class Client : IDisposable
+public class Client
 {
     const string DEFAULT_HOST = "api.opensubtitles.com";
     const string URL_PREFIX = "api/v1";
@@ -26,33 +27,20 @@ public class Client : IDisposable
 
     readonly REST.Client _client;
 
+    #region Constructor
 
-
-
-
-    #region Constructor / Dispose
-
-    public Client(string appName = null, Version appVersion = null, string apiKey = null, HttpClient httpClient = null)
+    public Client(string appName = null, Version appVersion = null, string apiKey = null, ILogger<Client> logger = null)
     {
         AppName = appName;
         AppVersion = appVersion;
         ApiKey = apiKey;
 
-        _client = new(httpClient ?? new())
+        _client = new(new HttpClient(new LoginRateLimiter()), logger)
         {
-            //Except for login, throttle is 5/sec
-            Throttle = 200,
             IncludeRawContentInResponse = true,
         };
         _client.DefaultRequestHeaders.Add("Accept", "*/*");
         SetHost(DEFAULT_HOST);
-    }
-
-
-    public void Dispose()
-    {
-        GC.SuppressFinalize(this);
-        _client.Dispose();
     }
 
     #endregion
@@ -75,10 +63,11 @@ public class Client : IDisposable
 
     public string Token { get; set; }
 
-    /// <summary>
-    /// How many times to retry a call when the server returns a 5xx status code. Default = 2, and the client will wait 1 second between retries.
-    /// </summary>
-    public uint RetryCount { get; set; } = 2;
+    public ushort RetryCount
+    {
+        get => _client.RetryCount;
+        set => _client.RetryCount = value;
+    }
 
     #endregion
 
@@ -90,50 +79,19 @@ public class Client : IDisposable
 
     public async Task<Response<LoginResponse>> LoginAsync(Credentials credentials, CancellationToken cancellationToken = default)
     {
-        var response = await PostAsync<LoginResponse>(TokenRequirementLevels.None, "login", credentials, cancellationToken, 1000).ConfigureAwait(false);
+        var response = await PostAsync<LoginResponse>(TokenRequirementLevels.None, "login", credentials, cancellationToken).ConfigureAwait(false);
         if (response.Success)
         {
-            response.Data.TokenExpiresUTC = DateTime.UtcNow.AddDays(1).AddMinutes(-1);
-            RestoreSession(response.Data.GetSessionInfo());
+            Token = response.Data.Token;
+            response.Data.TokenExpiresUTC = DateTime.UtcNow.AddHours(24).AddMinutes(-1);
+            SetHost(response.Data.BasedUrl);
         }
-        else
-        {
-            try
-            {
-                var imr = JsonSerializer.Deserialize<InternalMessageResponse>(response.RawContent);
-                if (!string.IsNullOrWhiteSpace(imr.Message))
-                    response.Error = new Exception(imr.Message);
-            }
-            catch { }
-
-        }
-
-        FinalResponseHandler(response);
-
-        return response;
+        return FinalResponseHandler(response);
     }
 
+    public Task<Response<LogoutResponse>> LogoutAsync(CancellationToken cancellationToken = default) =>
+        DeleteAsync<LogoutResponse>(TokenRequirementLevels.Required, "logout", cancellationToken);
 
-    public async Task<Response<LogoutResponse>> LogoutAsync(CancellationToken cancellationToken = default)
-    {
-        var response = await DeleteAsync<LogoutResponse>(TokenRequirementLevels.Required, "logout", cancellationToken).ConfigureAwait(false);
-        if (!response.Success)
-        {
-            try
-            {
-                var imr = JsonSerializer.Deserialize<InternalMessageResponse>(response.RawContent);
-                if (!string.IsNullOrWhiteSpace(imr.Message))
-                    response.Error = new Exception(imr.Message);
-                else if (imr.Errors?.Count > 0)
-                    response.Error = new Exception("Errors: " + string.Join(", ", imr.Errors));
-            }
-            catch { }
-        }
-
-        FinalResponseHandler(response);
-
-        return response;
-    }
 
     /// <summary>
     /// NOT part of the api. This is here for convenience
@@ -155,50 +113,38 @@ public class Client : IDisposable
 
     #region Discover Endpoints
 
-    public async Task<Response<MovieFeaturesResponse>> GetPopularMovieFeaturesAsync(string language = LANGUAGE_VALUE_ALL, CancellationToken cancellationToken = default)
+    public Task<Response<MovieFeaturesResponse>> GetPopularMovieFeaturesAsync(string language = LANGUAGE_VALUE_ALL, CancellationToken cancellationToken = default)
     {
         string queryParams = GetLanguageAndTypeQueryParams(language, SubtitleTypes.Movie);
-
-        var response = await GetAsync<MovieFeaturesResponse>(TokenRequirementLevels.Optional, $"discover/popular?{queryParams}", cancellationToken).ConfigureAwait(false);
-        FinalResponseHandler(response);
-        return response;
+        return GetAsync<MovieFeaturesResponse>(TokenRequirementLevels.Optional, $"discover/popular?{queryParams}", cancellationToken);
     }
 
-    public async Task<Response<TvShowFeaturesResponse>> GetPopularTvShowFeaturesAsync(string language = LANGUAGE_VALUE_ALL, CancellationToken cancellationToken = default)
+    public Task<Response<TvShowFeaturesResponse>> GetPopularTvShowFeaturesAsync(string language = LANGUAGE_VALUE_ALL, CancellationToken cancellationToken = default)
     {
         string queryParams = GetLanguageAndTypeQueryParams(language, SubtitleTypes.TvShow);
-
-        var response = await GetAsync<TvShowFeaturesResponse>(TokenRequirementLevels.Optional, $"discover/popular?{queryParams}", cancellationToken).ConfigureAwait(false);
-        FinalResponseHandler(response);
-        return response;
+        return GetAsync<TvShowFeaturesResponse>(TokenRequirementLevels.Optional, $"discover/popular?{queryParams}", cancellationToken);
     }
 
-    public async Task<Response<SubtitlesResponse>> GetLatestSubtitlesAsync(SubtitleTypes subtitleType = SubtitleTypes.Movie, string language = LANGUAGE_VALUE_ALL, CancellationToken cancellationToken = default)
+    public Task<Response<SubtitlesResponse>> GetLatestSubtitlesAsync(SubtitleTypes subtitleType = SubtitleTypes.Movie, string language = LANGUAGE_VALUE_ALL, CancellationToken cancellationToken = default)
     {
         string queryParams = GetLanguageAndTypeQueryParams(language, subtitleType);
-
-        var response = await GetAsync<SubtitlesResponse>(TokenRequirementLevels.Optional, $"discover/latest?{queryParams}", cancellationToken).ConfigureAwait(false);
-        FinalResponseHandler(response);
-        return response;
+        return GetAsync<SubtitlesResponse>(TokenRequirementLevels.Optional, $"discover/latest?{queryParams}", cancellationToken);
     }
 
-    public async Task<Response<SubtitlesResponse>> GetMostDownloadedSubtitlesAsync(SubtitleTypes subtitleType = SubtitleTypes.Movie, string language = LANGUAGE_VALUE_ALL, CancellationToken cancellationToken = default)
+    public Task<Response<SubtitlesResponse>> GetMostDownloadedSubtitlesAsync(SubtitleTypes subtitleType = SubtitleTypes.Movie, string language = LANGUAGE_VALUE_ALL, CancellationToken cancellationToken = default)
     {
         string queryParams = GetLanguageAndTypeQueryParams(language, subtitleType);
-
-        var response = await GetAsync<SubtitlesResponse>(TokenRequirementLevels.Optional, $"discover/most_downloaded?{queryParams}", cancellationToken).ConfigureAwait(false);
-        FinalResponseHandler(response);
-        return response;
+        return GetAsync<SubtitlesResponse>(TokenRequirementLevels.Optional, $"discover/most_downloaded?{queryParams}", cancellationToken);
     }
 
     static string GetLanguageAndTypeQueryParams(string language, SubtitleTypes subtitleType)
     {
         string queryParams = string.Empty;
-        if(string.IsNullOrWhiteSpace(language))
+        if (string.IsNullOrWhiteSpace(language))
             language = LANGUAGE_VALUE_ALL;
 
         queryParams = QueryParamBuilder.AddQueryParam(queryParams, "language", language);
-                
+
         string stype = subtitleType == SubtitleTypes.TvShow ? "tvshow" : "movie";
         queryParams = QueryParamBuilder.AddQueryParam(queryParams, "type", stype);
 
@@ -216,12 +162,8 @@ public class Client : IDisposable
     /// <summary>
     /// The download count is calculated on this action, not the file download itself
     /// </summary>
-    public async Task<Response<DownloadResponse>> GetDownloadAsync(DownloadRequest request, CancellationToken cancellationToken = default)
-    {
-        var response = await PostAsync<DownloadResponse>(TokenRequirementLevels.Required, "download", request, cancellationToken).ConfigureAwait(false);
-        FinalResponseHandler(response);
-        return response;
-    }
+    public Task<Response<DownloadResponse>> GetDownloadAsync(DownloadRequest request, CancellationToken cancellationToken = default) =>
+        PostAsync<DownloadResponse>(TokenRequirementLevels.Required, "download", request, cancellationToken);
 
     #endregion
 
@@ -231,31 +173,22 @@ public class Client : IDisposable
 
     #region Feature Endpoints
 
-    public async Task<Response<MovieFeaturesResponse>> SearchForMovieFeaturesAsync(SearchFeatureRequest request, CancellationToken cancellationToken = default)
+    public Task<Response<MovieFeaturesResponse>> SearchForMovieFeaturesAsync(SearchFeatureRequest request, CancellationToken cancellationToken = default)
     {
         string queryParams = request.ToQueryParams("movie");
-
-        var response = await GetAsync<MovieFeaturesResponse>(TokenRequirementLevels.Optional, $"features?{queryParams}", cancellationToken).ConfigureAwait(false);
-        FinalResponseHandler(response);
-        return response;
+        return GetAsync<MovieFeaturesResponse>(TokenRequirementLevels.Optional, $"features?{queryParams}", cancellationToken);
     }
 
-    public async Task<Response<TvShowFeaturesResponse>> SearchForTvShowFeaturesAsync(SearchFeatureRequest request, CancellationToken cancellationToken = default)
+    public Task<Response<TvShowFeaturesResponse>> SearchForTvShowFeaturesAsync(SearchFeatureRequest request, CancellationToken cancellationToken = default)
     {
         string queryParams = request.ToQueryParams("tvshow");
-
-        var response = await GetAsync<TvShowFeaturesResponse>(TokenRequirementLevels.Optional, $"features?{queryParams}", cancellationToken).ConfigureAwait(false);
-        FinalResponseHandler(response);
-        return response;
+        return GetAsync<TvShowFeaturesResponse>(TokenRequirementLevels.Optional, $"features?{queryParams}", cancellationToken);
     }
 
-    public async Task<Response<EpisodeFeatureResponse>> SearchForEpisodeeaturesAsync(SearchFeatureRequest request, CancellationToken cancellationToken = default)
+    public Task<Response<EpisodeFeatureResponse>> SearchForEpisodeeaturesAsync(SearchFeatureRequest request, CancellationToken cancellationToken = default)
     {
         string queryParams = request.ToQueryParams("episode");
-
-        var response = await GetAsync<EpisodeFeatureResponse>(TokenRequirementLevels.Optional, $"features?{queryParams}", cancellationToken).ConfigureAwait(false);
-        FinalResponseHandler(response);
-        return response;
+        return GetAsync<EpisodeFeatureResponse>(TokenRequirementLevels.Optional, $"features?{queryParams}", cancellationToken);
     }
 
     #endregion
@@ -266,26 +199,14 @@ public class Client : IDisposable
 
     #region Infos Endpoints
 
-    public async Task<Response<SubtitleFormatsResponse>> GetSubtitleFormatsAsync(CancellationToken cancellationToken = default)
-    {
-        var response = await GetAsync<SubtitleFormatsResponse>(TokenRequirementLevels.Optional, $"infos/formats", cancellationToken).ConfigureAwait(false);
-        FinalResponseHandler(response);
-        return response;
-    }
+    public Task<Response<SubtitleFormatsResponse>> GetSubtitleFormatsAsync(CancellationToken cancellationToken = default) =>
+        GetAsync<SubtitleFormatsResponse>(TokenRequirementLevels.Optional, $"infos/formats", cancellationToken);
 
-    public async Task<Response<LanguagesResponse>> GetLanguagesAsync(CancellationToken cancellationToken = default)
-    {
-        var response = await GetAsync<LanguagesResponse>(TokenRequirementLevels.Optional, $"infos/languages", cancellationToken).ConfigureAwait(false);
-        FinalResponseHandler(response);
-        return response;
-    }
+    public Task<Response<LanguagesResponse>> GetLanguagesAsync(CancellationToken cancellationToken = default) =>
+        GetAsync<LanguagesResponse>(TokenRequirementLevels.Optional, $"infos/languages", cancellationToken);
 
-    public async Task<Response<UserInformationResponse>> GetUserInformationAsync(CancellationToken cancellationToken = default)
-    {
-        var response = await GetAsync<UserInformationResponse>(TokenRequirementLevels.Required, $"infos/user", cancellationToken).ConfigureAwait(false);
-        FinalResponseHandler(response);
-        return response;
-    }
+    public Task<Response<UserInformationResponse>> GetUserInformationAsync(CancellationToken cancellationToken = default) =>
+        GetAsync<UserInformationResponse>(TokenRequirementLevels.Required, $"infos/user", cancellationToken);
 
     #endregion
 
@@ -295,13 +216,10 @@ public class Client : IDisposable
 
     #region Subtitle Endpoints
 
-    public async Task<Response<SubtitlesResponse>> SearchAsync(SearchSubtitleRequest request, CancellationToken cancellationToken = default)
+    public Task<Response<SubtitlesResponse>> SearchAsync(SearchSubtitleRequest request, CancellationToken cancellationToken = default)
     {
         string queryParams = request.ToQueryParams();
-
-        var response = await GetAsync<SubtitlesResponse>(TokenRequirementLevels.Optional, $"subtitles?{queryParams}", cancellationToken).ConfigureAwait(false);
-        FinalResponseHandler(response);
-        return response;
+        return GetAsync<SubtitlesResponse>(TokenRequirementLevels.Optional, $"subtitles?{queryParams}", cancellationToken);
     }
 
     #endregion
@@ -312,13 +230,10 @@ public class Client : IDisposable
 
     #region Guessit Endpoints
 
-    public async Task<Response<GuessitResponse>> GuessitAsync(string filename, CancellationToken cancellationToken = default)
+    public Task<Response<GuessitResponse>> GuessitAsync(string filename, CancellationToken cancellationToken = default)
     {
         string queryParams = QueryParamBuilder.AddQueryParam(string.Empty, "filename", filename);
-
-        var response = await GetAsync<GuessitResponse>(TokenRequirementLevels.Optional, $"utilities/guessit?{queryParams}", cancellationToken).ConfigureAwait(false);
-        FinalResponseHandler(response);
-        return response;
+        return GetAsync<GuessitResponse>(TokenRequirementLevels.Optional, $"utilities/guessit?{queryParams}", cancellationToken);
     }
 
     #endregion
@@ -329,15 +244,30 @@ public class Client : IDisposable
 
     #region Internal Methods
 
-    void SetHost(string host) => _client.BaseAddress = new($"https://{host}/api/v1/");
+    void SetHost(string host) => _client.BaseAddress = new($"https://{host}/{URL_PREFIX}/");
             
-    void FinalResponseHandler(Response response)
+    Response<T> FinalResponseHandler<T>(Response<T> response)
     {
+        if (!response.Success)
+        {
+            try
+            {
+                var imr = JsonSerializer.Deserialize<InternalMessageResponse>(response.RawContent, _client.JsonSerializerOptions);
+                if (!string.IsNullOrWhiteSpace(imr.Message))
+                    response.Error = new Exception(imr.Message);
+                else if (imr.Errors?.Count > 0)
+                    response.Error = new Exception("Errors: " + string.Join(", ", imr.Errors));
+            }
+            catch { }
+        }
+
         if (!IncludeRawContentInResponse)
             response.RawContent = null;
 
         if(AutoThrowIfError)
             response.ThrowIfError();
+
+        return response;
     }
     
     Dictionary<string, string> CreateHeaders(TokenRequirementLevels tokenRequirementLevel)
@@ -365,103 +295,56 @@ public class Client : IDisposable
 
         return ret;
     }
+   
 
-    
-
-    async Task<Response<T>> PostAsync<T>(TokenRequirementLevels tokenRequirementLevel, string url, object data, CancellationToken cancellationToken, int throttle = 250)
+    async Task<Response<T>> PostAsync<T>(TokenRequirementLevels tokenRequirementLevel, string url, object data, CancellationToken cancellationToken)
     {
         Dictionary<string, string> headers;
-        try { headers = CreateHeaders(tokenRequirementLevel); }
+        try
+        {
+            headers = CreateHeaders(tokenRequirementLevel);
+        }
         catch (Exception ex)
         {
             var ret = new Response<T> { Error = ex };
-            if (AutoThrowIfError)
-                ret.ThrowIfError();
             return ret;
         }
-
-        _client.Throttle = throttle;
-        var response = new Response<T> { StatusCode = HttpStatusCode.InternalServerError };
-        for (int i = 0; i < RetryCount + 1; i++)
-        {
-            if (!response.Success && (int)(response.StatusCode) >= 500)
-            {
-                if(i > 0)
-                    await Task.Delay(1000, cancellationToken).ConfigureAwait(false);
-                response = await _client.PostAsync<T>(url, data, headers, cancellationToken).ConfigureAwait(false);
-            }
-            else
-            {
-                break;
-            }
-        }
-
-        return response;
-
-    }
-    
-
-    async Task<Response<T>> GetAsync<T>(TokenRequirementLevels tokenRequirementLevel, string url, CancellationToken cancellationToken, int throttle = 250)
-    {
-        Dictionary<string, string> headers;
-        try { headers = CreateHeaders(tokenRequirementLevel); }
-        catch (Exception ex)
-        {
-            var ret = new Response<T> { Error = ex };
-            if (AutoThrowIfError)
-                ret.ThrowIfError();
-            return ret;
-        }
-
-        _client.Throttle = throttle;
-        var response = new Response<T> { StatusCode = HttpStatusCode.InternalServerError };
-        for (int i = 0; i < RetryCount + 1; i++)
-        {
-            if (!response.Success && (int)(response.StatusCode) >= 500)
-            {
-                if (i > 0)
-                    await Task.Delay(1000, cancellationToken).ConfigureAwait(false);
-                response = await _client.GetAsync<T>(url, headers, cancellationToken).ConfigureAwait(false);
-            }
-            else
-            {
-                break;
-            }
-        }
-
-        return response;
+        var response = await _client.PostAsync<T>(url, data, headers, cancellationToken).ConfigureAwait(false);
+        return FinalResponseHandler(response);
     }
 
 
-    async Task<Response<T>> DeleteAsync<T>(TokenRequirementLevels tokenRequirementLevel, string url, CancellationToken cancellationToken, int throttle = 250)
+    async Task<Response<T>> GetAsync<T>(TokenRequirementLevels tokenRequirementLevel, string url, CancellationToken cancellationToken)
     {
         Dictionary<string, string> headers;
-        try { headers = CreateHeaders(tokenRequirementLevel); }
+        try
+        {
+            headers = CreateHeaders(tokenRequirementLevel);
+        }
         catch (Exception ex)
         {
-            var ret = new Response<T> { Error = ex };
-            if (AutoThrowIfError)
-                ret.ThrowIfError();
-            return ret;
+            return new Response<T> { Error = ex };
         }
 
-        _client.Throttle = throttle;
-        var response = new Response<T> { StatusCode = HttpStatusCode.InternalServerError };
-        for (int i = 0; i < RetryCount + 1; i++)
+        var response = await _client.GetAsync<T>(url, headers, cancellationToken).ConfigureAwait(false);
+        return FinalResponseHandler(response);
+    }
+
+
+    async Task<Response<T>> DeleteAsync<T>(TokenRequirementLevels tokenRequirementLevel, string url, CancellationToken cancellationToken)
+    {
+        Dictionary<string, string> headers;
+        try
         {
-            if (!response.Success && (int)(response.StatusCode) >= 500)
-            {
-                if (i > 0)
-                    await Task.Delay(1000, cancellationToken).ConfigureAwait(false);
-                response = await _client.DeleteAsync<T>(url, headers, null, cancellationToken).ConfigureAwait(false);
-            }
-            else
-            {
-                break;
-            }
+            headers = CreateHeaders(tokenRequirementLevel);
+        }
+        catch (Exception ex)
+        {
+            return new Response<T> { Error = ex };
         }
 
-        return response;
+        var response = await _client.DeleteAsync<T>(url, headers, null, cancellationToken).ConfigureAwait(false);
+        return FinalResponseHandler(response);
     }
 
     #endregion
