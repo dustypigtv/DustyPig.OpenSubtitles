@@ -1,21 +1,20 @@
 ﻿using DustyPig.REST;
 using System;
-using System.Net;
 using System.Net.Http;
-using System.Net.Http.Headers;
 using System.Threading;
 using System.Threading.Tasks;
 
 namespace DustyPig.OpenSubtitles;
 
-internal class CustomRateThrottle : DelegatingHandler
+/// <summary>
+/// The API allows 5 requests per second, except for the login endpoint which is limited to 1 request per second. 
+/// This throttle handles the login endpoint, and passes other endpoints to a <see cref="SlidingRateThrottle"/>
+/// </summary>
+public class EndpointSpecificThrottle : DelegatingHandler
 {
     private readonly SemaphoreSlim _semaphore = new(1, 1);
 
-    /// <summary>
-    /// API allows 5 requests per second, except for the login endpoint which is limited to 1 request per second
-    /// </summary>
-    public CustomRateThrottle() : base(new SlidingRateThrottle(5, TimeSpan.FromSeconds(1)))
+    public EndpointSpecificThrottle() : base(new SlidingRateThrottle(5, TimeSpan.FromSeconds(1)))
     {
     }
 

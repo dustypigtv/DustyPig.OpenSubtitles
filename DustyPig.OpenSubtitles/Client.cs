@@ -25,17 +25,21 @@ public class Client
         Required
     }
 
-    readonly REST.Client _client;
+    private static readonly HttpClient _internalHttpClient = new(new EndpointSpecificThrottle());
 
+    private readonly REST.Client _client;
+    
     #region Constructor
 
-    public Client(string appName = null, Version appVersion = null, string apiKey = null, ILogger<Client> logger = null)
+    public Client(string appName = null, Version appVersion = null, string apiKey = null, HttpClient httpClient = null, ILogger<Client> logger = null)
     {
         AppName = appName;
         AppVersion = appVersion;
         ApiKey = apiKey;
 
-        _client = new(new HttpClient(new CustomRateThrottle()), logger)
+
+
+        _client = new(httpClient ?? _internalHttpClient, logger)
         {
             IncludeRawContentInResponse = true,
         };
