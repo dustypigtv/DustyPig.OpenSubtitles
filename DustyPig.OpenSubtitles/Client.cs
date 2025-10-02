@@ -35,7 +35,7 @@ public class Client
         AppVersion = appVersion;
         ApiKey = apiKey;
 
-        _client = new(new HttpClient(new CustomRateLimiter()), logger)
+        _client = new(new HttpClient(new CustomRateThrottle()), logger)
         {
             IncludeRawContentInResponse = true,
         };
